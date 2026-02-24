@@ -2,8 +2,6 @@
 import pandas as pd
 import numpy as np
 
-from collections import Counter
-
 
 def latlon_to_xyz( lat, lon , R = 1.0 ):
     """
@@ -113,17 +111,26 @@ def circular_mean(weights, angles):
     return np.arctan2(y, x)
 
 
-def spherical_relax_round(points_ll , nb_sectors , learning_rate  ):
+def spherical_relax_round(points_ll , nb_sectors , learning_rate , point_weights=None ):
     """
     :param points_ll: array containing points longitude and latitude (numpy.array)
     :nb_sectors: number of sectors to consider around each point (int)
     :learning_rate: Controls the rate at which positions are updated 
+    :param point_weights: optional array of per-point repulsion weights (numpy.array).
+        When provided, each neighbor's contribution to a sector is its weight rather
+        than 1, so higher-weight points push surrounding points away more strongly.
+        If None, all points are treated equally.
 
     :return: updated point longitude and latitude after a round of relaxation (numpy.array)
     """
     nb_points = len( points_ll )
     stp = np.pi*2 / nb_sectors
     anchor_angles = np.arange( 0.5 * stp, np.pi*2  , stp ) 
+
+    if point_weights is None:
+        point_weights = np.ones( nb_points )
+
+    total_weight = point_weights.sum()
 
     clat = np.cos( points_ll[:,1] ) 
     slat = np.sin( points_ll[:,1] )
@@ -138,10 +145,17 @@ def spherical_relax_round(points_ll , nb_sectors , learning_rate  ):
 
         
         sectors = ((np.array( angles+np.pi ) / (2*np.pi))*nb_sectors).astype(int)
-        sector_count = Counter(sectors)
+        sectors = np.clip( sectors, 0, nb_sectors - 1 )  # safety clamp for floating-point edge cases
 
-        weights = np.array( [sector_count.get(i,0) / ( nb_points-1 ) for i in range( nb_sectors )] )
-        weights /= weights.sum()
+        # Sum each neighbor's weight into its sector.  Exclude the self-contribution
+        # so a point's own weight does not bias its own movement direction.
+        sector_weight_sum = np.bincount( sectors, weights=point_weights, minlength=nb_sectors )
+        sector_weight_sum[ sectors[i] ] -= point_weights[i]
+
+        denom = total_weight - point_weights[i]
+        weights = sector_weight_sum / denom if denom > 0 else sector_weight_sum
+        if weights.sum() > 0:
+            weights /= weights.sum()
 
         dist = get_dist_from_anchor( anchor_angles , weights ) ## 
         bearing = circular_mean(weights, anchor_angles)
@@ -186,6 +200,11 @@ if __name__ == "__main__":
              help='''Controls the rate at which positions are updated from round to round. Lower values increase point movements precision but more relaxation rounds may be needed.
              Values should be in the interval (0,1].''')
 
+    parser.add_argument('--weight-column', type=str, default=None,
+             help='''Name of a column in the input CSV to use as per-point repulsion weights.
+             Points with higher weights repel their neighbors more strongly, acquiring more
+             space on the sphere surface.  If not specified all points are treated equally.
+             Weights are internally normalised so that their mean equals 1.''')
 
 
     args = parser.parse_args()
@@ -233,6 +252,24 @@ if __name__ == "__main__":
         if not c in 'xyz':
             additional_columns.append(c)
 
+    ## load per-point repulsion weights if requested
+    point_weights = None
+    if args.weight_column is not None:
+        if args.weight_column not in df_pts.columns:
+            print(f"Weight column '{args.weight_column}' not found in input file.")
+            print(f"Available columns: {list(df_pts.columns)}")
+            exit(1)
+        point_weights = df_pts[args.weight_column].values.astype(float)
+        if point_weights.min() < 0:
+            print("Warning: negative weights detected; they will be clipped to 0.")
+            point_weights = np.clip(point_weights, 0, None)
+        mean_w = point_weights.mean()
+        if mean_w == 0:
+            print("Error: all weights are zero.")
+            exit(1)
+        point_weights = point_weights / mean_w  # normalise so mean weight == 1
+        print(f"Using weight column '{args.weight_column}' (normalised to mean=1).")
+
 
 
 
@@ -256,7 +293,7 @@ if __name__ == "__main__":
     for r in range(1,nb_rounds+1):
 
 
-        data = spherical_relax_round( data , nb_sectors=nb_sectors, learning_rate=learning_rate ) 
+        data = spherical_relax_round( data , nb_sectors=nb_sectors, learning_rate=learning_rate , point_weights=point_weights ) 
         if r % write_every == 0 :
             ## output
             data_xyz = latlon_to_xyz(data[:,1], data[:,0]) ## NB: data is lon,lat ... 
